@@ -1,5 +1,20 @@
-import os, hmac, hashlib, subprocess, pathlib, logging
+# webhook_app.py
+import os
+import hmac
+import hashlib
+import subprocess
+import logging
+from pathlib import Path
+
 from fastapi import FastAPI, Request, HTTPException, Header, BackgroundTasks
+from dotenv import load_dotenv  # <-- добавляем загрузку .env
+
+# --------------------------------------------------------------------------- #
+# 1️⃣  Загрузка переменных окружения из .env
+# --------------------------------------------------------------------------- #
+load_dotenv()                     # читает .env в текущей директории
+SCRIPT_PATH = os.getenv("SCRIPT_PATH")
+# --------------------------------------------------------------------------- #
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -19,24 +34,59 @@ def verify_signature(payload: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def handle_push(payload: dict):
-    repo_dir = pathlib.Path(os.getenv("REPO_PATH", ".")).resolve()
+def run_script() -> None:
+    """Запускает скрипт и логирует вывод."""
+    if not SCRIPT_PATH.is_file():
+        log.error("Script %s not found!", SCRIPT_PATH)
+        return
+
+    # Запускаем скрипт без оболочки (чтобы избежать проблем с `shell=True`)
+    proc = subprocess.run(
+        [str(SCRIPT_PATH)],
+        capture_output=True,
+        text=True,
+        env=os.environ,  # передаём переменные окружения (REPO_PATH, SERVICE_NAME …)
+    )
+
+    if proc.returncode == 0:
+        log.info("✅ Script %s completed successfully.", SCRIPT_PATH)
+        log.debug("Script stdout:\n%s", proc.stdout.strip())
+    else:
+        log.error(
+            "❌ Script %s failed with rc=%s.",
+            SCRIPT_PATH,
+            proc.returncode,
+        )
+        log.error("stderr:\n%s", proc.stderr.strip())
+
+
+def handle_push(payload: dict) -> None:
+    """
+    Обрабатываем push‑событие:
+    1. Делаете git pull (можно оставить, если скрипт делает то же самое).
+    2. Запускаем пользовательский скрипт.
+    """
+    repo_dir = Path(os.getenv("REPO_PATH", ".")).resolve()
     if not (repo_dir / ".git").exists():
         log.error("Repo not found at %s", repo_dir)
         return
 
-    # 1️⃣ git pull
-    result = subprocess.run(
-        ["git", "pull"], cwd=repo_dir, capture_output=True, text=True
+    # --- 1️⃣ Git pull (необязательно, если скрипт всё делает) ---
+    pull_res = subprocess.run(
+        ["git", "pull"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
     )
-    log.info("[git pull] rc=%s out=%s err=%s",
-             result.returncode, result.stdout.strip(), result.stderr.strip())
+    log.info(
+        "[git pull] rc=%s out=%s err=%s",
+        pull_res.returncode,
+        pull_res.stdout.strip(),
+        pull_res.stderr.strip(),
+    )
 
-    # 2️⃣ restart service (if any)
-    svc = os.getenv("SERVICE_NAME")
-    if svc and result.returncode == 0:
-        restart = subprocess.run(["systemctl", "restart", svc], capture_output=True, text=True)
-        log.info("[service] restarted %s rc=%s", svc, restart.returncode)
+    # --- 2️⃣ Запуск кастомного скрипта ---
+    run_script()
 
 
 @app.post("/github-webhook")
